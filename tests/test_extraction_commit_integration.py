@@ -11,6 +11,7 @@ import tempfile
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -109,6 +110,21 @@ class ExtractionCommitTest(unittest.TestCase):
         self.assertTrue(any("医院" in text for text in memories), memories)
         self.assertIsNone(self.service.next_extraction_task())
 
+    def test_retrying_failed_writeback_reuses_prepared_result(self) -> None:
+        source_id = self.add_source()
+        task = self.service.next_extraction_task()
+        assert task is not None
+        with patch.object(self.db.artifacts, "commit", side_effect=OSError("temporary write failure")):
+            first = self.service.commit_extraction(task.source_ids, _payload(source_id))
+        self.assertTrue(first.retryable)
+        self.assertEqual(len(self.buffer.items), 1)
+        # The retry must use the prepared plan, not trust a changed model response.
+        second = self.service.commit_extraction(task.source_ids, "not json")
+        self.assertEqual(second.written, 1, second.errors)
+        self.assertFalse(second.retryable)
+        self.assertEqual(len(self.buffer.items), 0)
+        self.assertEqual(len(list(self.cache.active("memory"))), 1)
+
     def test_commit_rejects_consumed_task(self) -> None:
         source_id = self.add_source()
         task = self.service.next_extraction_task()
@@ -147,7 +163,7 @@ class LoopbackEndpointTest(unittest.TestCase):
     """Cover the HTTP mapping of the loopback plan/commit endpoints / 覆盖回环服务端点映射。"""
 
     def setUp(self) -> None:
-        from scripts.serve import MemoryService
+        from adapters.loopback.runtime import MemoryService
 
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -175,6 +191,36 @@ class LoopbackEndpointTest(unittest.TestCase):
         self.assertEqual(result["written"], 0)
         self.assertEqual(result["skipped"], 1)
         self.assertEqual(self.service.extract_plan({})[0], 204)
+
+    def test_unknown_task_cannot_write_or_consume_another_subject(self) -> None:
+        code, captured = self.service.capture({"text": "我周末要去医院检查眼睛", "role": "user"})
+        self.assertEqual(code, 200)
+        source_id = captured["source_id"]
+        code, payload = self.service.extract_commit({
+            "task_id": "forged", "source_ids": [source_id],
+            "chat_response": {"text": _payload(source_id)},
+        })
+        self.assertEqual((code, payload["error"]), (409, "task_stale"))
+        self.assertEqual(self.service.extract_plan({"subject_key": "different"})[0], 204)
+        self.assertEqual(self.service.extract_plan({"subject_key": "u1"})[0], 200)
+        self.assertEqual(len(self.service.buffer.items), 1)
+        self.assertEqual(list(self.service.cache.active("memory")), [])
+
+    def test_real_commit_recall_observes_artifact(self) -> None:
+        code, captured = self.service.capture({"text": "我周末要去医院检查眼睛", "role": "user",
+                                                "at": "2026-10-29T10:00:00"})
+        self.assertEqual(code, 200)
+        code, plan = self.service.extract_plan({"subject_key": "u1"})
+        self.assertEqual(code, 200)
+        code, result = self.service.extract_commit({
+            "task_id": plan["task_id"], "chat_response": {"text": _payload(captured["source_id"])},
+        })
+        self.assertEqual(code, 200, result)
+        self.assertEqual(result["written"], 1)
+        code, recall = self.service.recall({"subject_key": "u1", "query": "医院 检查 眼睛"})
+        self.assertEqual(code, 200)
+        self.assertEqual(recall["items"][0]["id"], result["ids"][0])
+        self.assertEqual(self.service.extract_plan({"subject_key": "u1"})[0], 204)
 
     def test_commit_without_task_is_conflict(self) -> None:
         code, payload = self.service.extract_commit({

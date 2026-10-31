@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
-import hashlib
+import secrets
 import re
 from dataclasses import replace
 from functools import partial
@@ -72,10 +72,9 @@ from .ingest_state import ExtractionTask, PreparedExtraction
 from .ingest_selection import ReadyTopic, ResolvedBatch, group_batches, budget_reached
 
 
-def _task_id(source_ids: tuple[str, ...]) -> str:
-    """Derive a stable, content-free task id from admitted Source IDs / 由已接纳原始消息编号派生稳定且不含正文的任务编号。"""
-    digest = hashlib.sha1("\n".join(source_ids).encode("utf-8")).hexdigest()
-    return f"ex-{digest[:16]}"
+def _task_id() -> str:
+    """Give each issued task an unguessable process-local ID / 为派发任务生成不可猜测的本进程编号。"""
+    return f"ex-{secrets.token_hex(16)}"
 
 
 class IngestService:
@@ -568,23 +567,20 @@ class IngestService:
             errors=tuple(errors), retryable=retryable,
         ), usage)
 
-    def next_extraction_task(self, *, max_turns: int = 12) -> ExtractionTask | None:
+    def next_extraction_task(self, *, max_turns: int = 12, subject_key: str = "") -> ExtractionTask | None:
         """Read the oldest ready topic as a pull-style task without calling a model.
 
         读取最早就绪话题作为拉取式任务，不调用模型；写回由 commit_extraction 负责。
         """
         if self.buffer is None or self.extraction is None:
             return None
-        if self._prepared:
-            # Recover partially persisted plans before handing out new work.
-            # 在派发新任务前先补偿已部分持久化的计划，避免这些输入被永久占用。
-            self.retry_writebacks()
         ready = self.extraction.ready_extraction_ids()
         if not ready:
             return None
         rows = [
             turn for turn in self.buffer.items
             if turn.source_id and turn.source_id in ready and not self._reserved([turn])
+            and (not subject_key or turn.session_id == subject_key)
         ]
         if not rows:
             return None
@@ -596,7 +592,7 @@ class IngestService:
         context = recover_parents(selected, self.sources)
         source_ids = tuple(turn.source_id for turn in selected)
         return ExtractionTask(
-            task_id=_task_id(source_ids),
+            task_id=_task_id(),
             source_ids=source_ids,
             session_id=session_id,
             topic_id=topic_id,
@@ -623,12 +619,18 @@ class IngestService:
         if not wanted:
             return WriteOutcome(errors=("source_ids required",))
         rows = [turn for turn in self.buffer.items if turn.source_id in wanted]
-        if {turn.source_id for turn in rows} != wanted:
+        if {turn.source_id for turn in rows} != wanted or not rows:
             return WriteOutcome(errors=("task_stale",))
+        if len({(turn.session_id, turn.topic_id) for turn in rows}) != 1:
+            return WriteOutcome(errors=("task_stale",))
+        receipt = self._prepared.get(tuple(rows))
+        if receipt is not None:
+            return self._persist_plan(receipt, lambda _name: nullcontext(), self.logger.info)
         try:
             context = recover_parents(rows, self.sources)
             plan = build_plan(
-                rows, context, str(raw or ""), self.cache, self.owner_id(), self.logger.info,
+                rows, context, str(raw or ""), self.cache,
+                rows[0].session_id or self.owner_id(), self.logger.info,
                 strict=True, require_evidence=False,
             )
         except Exception as exc:

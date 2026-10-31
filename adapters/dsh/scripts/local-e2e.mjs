@@ -103,7 +103,10 @@ console.log(`已写 patch: ${patchPath}`);
 console.log(`   runtimePath = ${yamlPath}`);
 
 // ---------- 2. 起 DSH（隔离 home，RUN_AS_NODE，不加载 Electron app 层） ----------
-const cli = path.join(path.dirname(dshExe), 'resources', 'app.asar', 'dsh', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js');
+const resources = process.platform === 'darwin'
+  ? path.join(path.dirname(path.dirname(dshExe)), 'Resources')
+  : path.join(path.dirname(dshExe), 'resources');
+const cli = path.join(resources, 'app.asar', 'dsh', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js');
 const logPath = path.join(home, 'seekmemory-logs', 'seekmemory.log');
 const before = existsSync(logPath) ? readFileSync(logPath, 'utf8').length : 0;
 
@@ -147,8 +150,9 @@ const contract = spawnSync(process.execPath, [path.join(HERE, 'check-kernel-cont
 process.stdout.write(contract.stdout ?? '');
 if (contract.status !== 0) {
   process.stderr.write(contract.stderr ?? '');
-  expect('内核端点契约（15 项）', false, `exit=${contract.status}`);
-} else expect('内核端点契约（15 项）', true);
+  expect('内核端点契约（含抽取提交）', false,
+    contract.status === 2 ? '未完成：抽取计划/提交返回 501' : `exit=${contract.status}`);
+} else expect('内核端点契约（含抽取提交）', true);
 
 console.log('--- 适配器通路冒烟 ---');
 const smoke = spawnSync(process.execPath, [path.join(HERE, 'smoke-contract.mjs'), '--runtime', runtimePath], {
@@ -159,7 +163,8 @@ const smoke = spawnSync(process.execPath, [path.join(HERE, 'smoke-contract.mjs')
 process.stdout.write(smoke.stdout ?? '');
 if (smoke.status !== 0) {
   process.stderr.write(smoke.stderr ?? '');
-  expect('适配器通路冒烟（11 项）', false, `exit=${smoke.status}`);
+  expect('适配器通路冒烟（11 项）', false,
+    smoke.status === 2 ? '未完成：须先用模型抽取记忆才能验证召回/隐私/预算' : `exit=${smoke.status}`);
 } else expect('适配器通路冒烟（11 项）', true);
 
 // ---------- 5. 结论 ----------
