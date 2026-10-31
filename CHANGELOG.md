@@ -4,11 +4,15 @@
 
 ### 中文
 
+- 补齐拉取式抽取的写回链路：内核新增公开入口 `IngestService.next_extraction_task` 与 `commit_extraction`，回环服务 `/extract/plan` 直接返回 task_id、source_ids 与提示词，`/extract/commit` 校验宿主回传的模型输出后走既有 build_plan 与计划提交流程。未知或已消费的任务返回 409；坏输出保留待处理行并计一次重试。不改数据库结构或公开配置。
+
 - #183 以现有树边表达多父关系，移除唯一父节点查询与单父字段写入。旧列保留但不用于树语义，旧库缺边时只读回退平面召回，不自动迁移。树查询分别限制深度、分支、访问量和结果数，合成相关性、路径距离及证据支持分后仍经披露；同主体、同范围、当前版本与 Source 证据仍是硬约束。内部开关默认关闭，不改公开配置或数据库结构。
 
 - 修复用户消息跨会话复用 event_id 时被误去重的问题：RunRecorder 的已完成记录与待补偿写入统一按现有 Source ID 区分，保留同一消息重放的幂等性及对外 turn_id，无数据格式或配置变化（#187）。
 
 ### English
+
+- Complete the pull-style extraction writeback: the kernel now exposes `IngestService.next_extraction_task` and `commit_extraction`; the loopback `/extract/plan` returns task_id, source_ids and prompts, and `/extract/commit` validates host-supplied model output before persisting through the existing build_plan and prepared-receipt pipeline. Unknown or consumed tasks return 409; invalid output keeps the pending rows and records one retry. No schema or public-config change.
 
 - #183 uses existing tree edges for multiple parents and removes unique-parent lookup and writes to the single-parent column. The old column remains inert; missing legacy edges trigger read-only flat-recall fallback without automatic migration. Depth, fan-out, visits and results are bounded, with query relevance, path distance and evidence support ranked before disclosure. Same subject/scope, current version and Source evidence remain hard guards. The internal rollout is off by default; no public configuration or schema change.
 

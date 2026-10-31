@@ -7,12 +7,13 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import hashlib
 import re
 from dataclasses import replace
 from functools import partial
 from contextlib import AbstractContextManager, nullcontext
 from typing import Any, Callable
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 
 try:
     from ..app.budget import estimate_tokens
@@ -67,8 +68,14 @@ except ImportError:
 
 
 from .diagnostics import diagnostic, span
-from .ingest_state import PreparedExtraction
+from .ingest_state import ExtractionTask, PreparedExtraction
 from .ingest_selection import ReadyTopic, ResolvedBatch, group_batches, budget_reached
+
+
+def _task_id(source_ids: tuple[str, ...]) -> str:
+    """Derive a stable, content-free task id from admitted Source IDs / 由已接纳原始消息编号派生稳定且不含正文的任务编号。"""
+    digest = hashlib.sha1("\n".join(source_ids).encode("utf-8")).hexdigest()
+    return f"ex-{digest[:16]}"
 
 
 class IngestService:
@@ -560,6 +567,81 @@ class IngestService:
             written=len(written_ids), skipped=skipped, ids=tuple(written_ids),
             errors=tuple(errors), retryable=retryable,
         ), usage)
+
+    def next_extraction_task(self, *, max_turns: int = 12) -> ExtractionTask | None:
+        """Read the oldest ready topic as a pull-style task without calling a model.
+
+        读取最早就绪话题作为拉取式任务，不调用模型；写回由 commit_extraction 负责。
+        """
+        if self.buffer is None or self.extraction is None:
+            return None
+        if self._prepared:
+            # Recover partially persisted plans before handing out new work.
+            # 在派发新任务前先补偿已部分持久化的计划，避免这些输入被永久占用。
+            self.retry_writebacks()
+        ready = self.extraction.ready_extraction_ids()
+        if not ready:
+            return None
+        rows = [
+            turn for turn in self.buffer.items
+            if turn.source_id and turn.source_id in ready and not self._reserved([turn])
+        ]
+        if not rows:
+            return None
+        session_id, topic_id = rows[0].session_id, rows[0].topic_id
+        selected = [
+            turn for turn in rows
+            if turn.session_id == session_id and turn.topic_id == topic_id
+        ][: max(1, int(max_turns))]
+        context = recover_parents(selected, self.sources)
+        source_ids = tuple(turn.source_id for turn in selected)
+        return ExtractionTask(
+            task_id=_task_id(source_ids),
+            source_ids=source_ids,
+            session_id=session_id,
+            topic_id=topic_id,
+            system_prompt=build_prompt([], require_evidence=False),
+            prompt=dialogue_of(context, include_topic=False),
+            require_evidence=False,
+        )
+
+    def commit_extraction(
+        self,
+        source_ids: Sequence[str],
+        raw: str,
+        *,
+        usage: tuple[int, int, int] = (0, 0, 0),
+        max_attempts: int = 5,
+    ) -> WriteOutcome:
+        """Persist a host-supplied extraction result through the existing plan pipeline.
+
+        通过既有计划管线持久化宿主回传的抽取结果；未知或已消费的输入不会被重复写入。
+        """
+        if self.buffer is None or self.artifacts is None or self.sources is None:
+            return WriteOutcome(errors=("invalid extraction commit",))
+        wanted = {str(value) for value in source_ids if value}
+        if not wanted:
+            return WriteOutcome(errors=("source_ids required",))
+        rows = [turn for turn in self.buffer.items if turn.source_id in wanted]
+        if {turn.source_id for turn in rows} != wanted:
+            return WriteOutcome(errors=("task_stale",))
+        try:
+            context = recover_parents(rows, self.sources)
+            plan = build_plan(
+                rows, context, str(raw or ""), self.cache, self.owner_id(), self.logger.info,
+                strict=True, require_evidence=False,
+            )
+        except Exception as exc:
+            self.buffer.mark_failed(rows, type(exc).__name__, max_attempts=max_attempts)
+            raise
+        if plan.outcome is not None and (plan.outcome.model_failed or plan.outcome.retryable):
+            self.buffer.mark_failed(rows, "plan_rejected", max_attempts=max_attempts)
+            return self._with_usage(plan.outcome, usage)
+        receipt = PreparedExtraction(plan, tuple(rows), True)
+        self._prepared[receipt.rows] = receipt
+        return self._persist_plan(
+            receipt, lambda _name: nullcontext(), self.logger.info, usage=usage,
+        )
 
     def _reserved(self, rows: list[DialogueTurn]) -> bool:
         """Whether pending recovery owns any supplied input / 待补偿工作是否占用了任一给定输入。"""

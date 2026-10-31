@@ -129,6 +129,9 @@ class MemoryService:
         self.status_service = StatusService(
             artifacts=self.store.artifacts, ledger=self.store.ledger,
         )
+        # Tasks handed to the host but not yet committed; process-local on purpose.
+        # 已交给宿主但尚未提交的任务；按设计仅保留在当前进程。
+        self.tasks: dict[str, Any] = {}
 
     # ---------- 端点 ----------
     def healthz(self) -> tuple[int, dict]:
@@ -187,41 +190,79 @@ class MemoryService:
         return 200, {
             "host_contract": HOST_CONTRACT,
             "phase": "idle",
-            "progress": {"phase": "idle", "pending": 0, "running": 0},
+            "progress": {"phase": "idle", "pending": len(self.buffer.items), "running": 0},
             "ledger_valid": bool(self.status_service.ledger_valid()),
             "uptime_s": round(time.time() - STARTED_AT),
         }
 
     def extract_plan(self, query: dict) -> tuple[int, dict]:
-        ready = self.store.extraction.ready_extraction_ids()
-        if not ready:
+        max_turns = int(query.get("max_turns") or self.config.get("extract_task_turns") or 12)
+        task = self.ingest.next_extraction_task(max_turns=max_turns)
+        if task is None:
             return 204, {}
-        rows = self.store.extraction.pending_extractions()
-        if not rows:
-            return 204, {}
-        first = rows[0]
+        self.tasks[task.task_id] = task
         return 200, {
-            "task_id": str(first.get("id") or first.get("source_id") or ""),
-            "source_ids": list(ready),
+            "task_id": task.task_id,
+            "source_ids": list(task.source_ids),
+            "session_id": task.session_id,
+            "topic_id": task.topic_id,
+            "turns": task.turns,
+            "chat_request": {
+                "system_prompt": task.system_prompt,
+                "prompt": task.prompt,
+                "max_tokens": int(self.config.get("extract_max_tokens", 800)),
+                "temperature": 0,
+            },
         }
 
     def extract_commit(self, body: dict) -> tuple[int, dict]:
-        """显式未实现：内核还没有跨进程的 plan→commit 公开 API。
+        """Persist host-supplied model output through the kernel plan pipeline.
 
-        现有路径是 IngestService.extract(rows, model) 在一次调用里完成
-        「调模型 → build_plan → _persist_plan」。要在独立进程里做 pull-style
-        提交，需要内核暴露「用宿主回传的 chat_response 持久化」的公开入口
-        （内部等价于 build_plan + PreparedExtraction + _persist_plan）。
-        在那之前这里返回 501，而不是伪造一个 200。
+        宿主自己调模型，这里只负责校验并持久化；未知或已消费的任务返回 409。
         """
         task_id = str(body.get("task_id") or "")
-        if not task_id:
-            return 400, {"error": "task_id is required"}
-        if body.get("chat_response") is None:
-            return 400, {"error": "chat_response is required"}
-        return 501, {
-            "error": "not_implemented",
-            "detail": "pull-style commit needs a public kernel API (build_plan + persist)",
+        task = self.tasks.get(task_id)
+        source_ids = [
+            str(value) for value in (body.get("source_ids") or (task.source_ids if task else ()))
+            if value
+        ]
+        if not source_ids:
+            return 409, {"error": "task_stale", "detail": "unknown task_id; call /extract/plan again"}
+        reply = body.get("chat_response")
+        usage_body = body.get("usage") or {}
+        if isinstance(reply, dict):
+            raw = str(reply.get("text") or "")
+            usage = (
+                int(reply.get("usage_in") or 0),
+                int(reply.get("usage_cached") or 0),
+                int(reply.get("usage_out") or 0),
+            )
+        elif isinstance(reply, str):
+            raw = reply
+            usage = (
+                int(usage_body.get("in") or 0),
+                int(usage_body.get("cached") or 0),
+                int(usage_body.get("out") or 0),
+            )
+        else:
+            raw = ""
+            usage = (0, 0, 0)
+        if not raw.strip():
+            return 400, {"error": "chat_response.text is required"}
+        try:
+            outcome = self.ingest.commit_extraction(source_ids, raw, usage=usage)
+        except Exception as exc:  # 解析失败已在队列里标记重试，这里只回传结果
+            return 422, {"error": "invalid_extraction", "detail": type(exc).__name__,
+                         "retryable": True}
+        if "task_stale" in outcome.errors:
+            return 409, {"error": "task_stale", "retryable": False}
+        self.tasks.pop(task_id, None)
+        return 200, {
+            "written": outcome.written,
+            "skipped": outcome.skipped,
+            "ids": list(outcome.ids),
+            "errors": list(outcome.errors),
+            "retryable": bool(outcome.retryable),
         }
 
 

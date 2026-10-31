@@ -15,8 +15,8 @@
  *   POST /recall        200 + block 字符串
  *   GET  /persona       200 + text 字符串
  *   GET  /status        200 + 对象
- *   GET  /extract/plan  200（有任务）或 204（没事干）
- *   POST /extract/commit 200 + written/skipped
+ *   GET  /extract/plan  200（任务含 task_id/source_ids/prompt）或 204（没事干）
+ *   POST /extract/commit 200 + written/skipped；未知或已消费任务 → 409
  * 另外两条安全/路由约束：错 token → 401，未知路径 → 404。
  *
  * 退出码：0 全部符合；1 有不符合项；2 参数或连接问题。
@@ -130,26 +130,39 @@ const payload = {
 }
 
 // 6. extract/plan（204 = 没事干，是合法契约的一部分）
+let task = null;
 {
   const r = await call(`/extract/plan?subject_key=${encodeURIComponent(SUBJECT)}`);
   expect('GET /extract/plan → 200 或 204', r.status === 200 || r.status === 204, `status=${r.status}`);
+  if (r.status === 200) {
+    task = r.data;
+    const req = r.data?.chat_request ?? {};
+    const okShape = typeof r.data?.task_id === 'string' && r.data.task_id.length > 0
+      && Array.isArray(r.data?.source_ids) && typeof req.prompt === 'string'
+      && req.prompt.length > 0;
+    expect('plan 返回 task_id / source_ids / chat_request.prompt', okShape,
+      `task_id=${JSON.stringify(r.data?.task_id)} prompt=${typeof req.prompt}`);
+  }
 }
 
 // 7. extract/commit
 {
-  const r = await call('/extract/commit', {
-    method: 'POST',
-    body: { task_id: 'contract-task-1', chat_response: { text: '[]', usage_in: 0, usage_out: 0 } },
-  });
-  // 501 = 内核明确表示「pull-style 提交还没实现」，与「实现错了」是两回事。
-  // 分开标注，才不会把待办混进缺陷里。
-  if (r.status === 501) {
-    expect('POST /extract/commit → 501（明确未实现，非缺陷）', true);
-  } else {
+  if (task && task.session_id === SUBJECT) {
+    // 只提交本脚本自己 capture 进去的任务，绝不消费内核里别人的待处理消息。
+    const body = { task_id: task.task_id, source_ids: task.source_ids, chat_response: { text: '[]' } };
+    const r = await call('/extract/commit', { method: 'POST', body });
     expect('POST /extract/commit → 200', r.status === 200, `status=${r.status}`);
     const okShape = typeof r.data?.written === 'number' || typeof r.data?.skipped === 'number';
     expect('commit 返回 written 或 skipped', okShape,
       `written=${JSON.stringify(r.data?.written)} skipped=${JSON.stringify(r.data?.skipped)}`);
+    const again = await call('/extract/commit', { method: 'POST', body });
+    expect('重复 commit 同一任务 → 409', again.status === 409, `status=${again.status}`);
+  } else {
+    const r = await call('/extract/commit', {
+      method: 'POST',
+      body: { task_id: 'no-such-task', chat_response: { text: '[]' } },
+    });
+    expect('未知任务 commit → 409', r.status === 409, `status=${r.status}`);
   }
 }
 
